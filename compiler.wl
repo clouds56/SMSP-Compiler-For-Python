@@ -268,11 +268,11 @@ StringCases[
 
     (*和弦符*)
     Shortest[name:WordCharacter...~~leftchord~~input___~~rightchord]:>If[name==""||UpperCaseQ@StringPart[name,1],
-    (*翻译和弦定义符*)
-    ChordDef[name,input],
+      (*翻译和弦定义符*)
+      ChordDef[name,input],
 
-    (*翻译和弦映射符*)
-    ChordMap[name,input]],
+      (*翻译和弦映射符*)
+      ChordMap[name,input]],
 
     (*主和弦符*)
     Shortest[pitch:pitchpat...~~name:WordCharacter...~~rightchord]:>ChordMain[pitch,name],
