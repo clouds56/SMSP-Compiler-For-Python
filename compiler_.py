@@ -120,6 +120,9 @@ class compiler:
 
         self.trclist[self.trackname] = dict(self.deftrack.items())
 
+    def eval(self, input_:str): # TODO: should use eval?
+        return eval(input_.replace("^", "**"), {}, {})
+
     def now_track(self):
         """NowTrack[]:=trclist[trackname];"""
         return self.trclist[self.trackname]
@@ -130,7 +133,7 @@ class compiler:
 
     def track_add_to(self, name:str, value):
         """TrackAddTo[name_,value_]:=(trclist[trackname][name]+=value);"""
-        self.trclist[self.trackname][name]+=value # TODO: list add has different behaviour
+        self.trclist[self.trackname][name]+=value
 
     def delete_comment(self, input_:str) -> str:
         """DeleteComment[input_]:=StringDelete[input,comment~~Except["\n"]..|""];"""
@@ -196,27 +199,40 @@ class compiler:
               name:WordCharacter..:>(name/.dlist)
             }];
         """
-        # TODO: the order of function define/override matters?
-        input_ = re.sub("(?P<name>[0-9a-zA-Z]+)\[(?P<input>[0-9a-zA-Z,]+)\]\s*\{(?P<output>[^}]*)\}",
-            lambda s: self.set_flist(s.group('name'), self.compile_f(s.group("input"),s.group("output"))), input_)
-        input_ = re.sub("(?P<name>[0-9a-zA-Z]+)\s*\{(?P<output>[^}]*)\}",
-            lambda s: self.set_flist(s.group('name'), self.compile_f("", s.group('output'))), input_)
-        input_ = re.sub("(?P<name>[0-9a-zA-Z]+)\[(?P<input>[0-9a-zA-Z,]+)\]",
-            lambda s: s.group(0) if s.group('name') not in self.flist else self.apply_f(s.group('input'), self.flist[s.group('name')]), input_)
-        input_ = re.sub("(?P<name>[0-9a-zA-Z]+)(\[\])?",
-            lambda s: s.group(0) if s.group('name') not in self.flist else self.apply_f("", self.flist[s.group('name')]), input_)
-        return input_
+        # TODO: [] match (not use regex)
+        tokens = [
+            ("fundef", r"(?P<name>[0-9a-zA-Z]+)\[(?P<input>[0-9a-zA-Z,]*)\]\s*\{(?P<output>[^}]*)\}"),
+            ("condef", r"(?P<name>[0-9a-zA-Z]+)\s*\{(?P<output>[^}]*)\}"),
+            ("funcall", r"(?P<name>[0-9a-zA-Z]+)\[(?P<input>[0-9a-zA-Z,]+)\]"),
+            ("concall", r"(?P<name>[0-9a-zA-Z]+)"),
+        ]
+        tokens = [(i, v.replace("?P<", "?P<"+i+"_")) for i, v in tokens]
+
+        def _fun(m) -> str:
+            kind = m.lastgroup
+            name = m.group(kind+'name')
+            if kind == "fundef_":
+                self.flist[name] = self.compile_f(m.group(kind+"input"), m.group(kind+"output"))
+                return ""
+            elif kind == "condef_":
+                self.flist[name] = self.compile_f("", self.func_replace(m.group(kind+"output")))
+                return ""
+            elif kind == "funcall_":
+                return m.group(kind) if name not in self.flist else self.apply_f(m.group(kind+"input"), self.flist[name])
+            elif kind == "concall_":
+                return m.group(kind) if name not in self.flist else self.flist[name]()
+        return re.sub("|".join(["(?P<%s_>%s)" % i for i in tokens]), _fun, input_)
 
     def compile_f(self, input_:str, output:str):
         params = re.findall("[0-9a-zA-Z]+", input_)
         def _fun(*args):
             rd = dict(zip(params, args))
-            return re.sub("|".join(params), lambda s: rd[s.group(0)], output)
-        return _fun if len(params) > 0 else lambda a: output
+            return re.sub("|".join([re.escape(i) for i in params]), lambda s: rd[s.group(0)], output)
+        return _fun if len(params) > 0 else lambda a="": output
 
     def apply_f(self, input_:str, func) -> str:
         args = input_.split(",")
-        return func(*args)
+        return self.func_replace(func(*args))
 
     def set_flist(self, name:str, func) -> str:
         self.flist[name] = func
@@ -236,8 +252,10 @@ class compiler:
         pitch_add = sum([self.pitchlist[i] for i in pitch if i in self.pitchlist])
         if element in self.chordmap:
             r = [i for i in self.chordmap[element](self.now_track()["chord"]) if isinstance(i, int)]
+        elif element in self.scale:
+            r = [self.scale[element]]
         else:
-            r = [self.scale[i] for i in element if i in self.scale]
+            return [element]
         return [self.base + i + pitch_add if isinstance(i, int) else i for i in r]
 
     def note_span(self, beat:str):
@@ -252,7 +270,9 @@ class compiler:
         NoteBeat[beat_]:=If[#==={},1,Total[#-UnitStep[#-2]]+UnitStep[#[[1]]-2]]&@StringCases[beat,beatlist];
         """
         t = [self.beatlist[i] for i in beat if i in self.beatlist]
-        return sum([i if i<2 else i-1 for i in t]) + (1 if len(t)>0 and t[0]==2 else 0)
+        if len(t) == 0:
+            return 1
+        return sum([i if i<2 else i-1 for i in t]) + (1 if t[0]==2 else 0)
 
     def note_hold(self, hold:str, beatvalue:float, starttime:float):
         """
@@ -407,6 +427,8 @@ class compiler:
                 self.chordlist[i+name[1:]] = [x+j if isinstance(x, int) else x for x in l]
         else:
             self.chordlist[name] = l
+        self.track_set("chord", self.chordlist[name])
+        print("chord_def:", name, l, file=sys.stderr)
 
     def chord_map(self, name:str, input_:str):
         """
@@ -433,12 +455,13 @@ class compiler:
             Nothing];
         """
         l_ = [x.strip() for x in input_.split(",")]
-        l = [(sum([self.pitchlist[j] for j in i if j in self.chordlist]), int(re.findall("[0-9]+",i)[0])) for i in l_]
+        l = [(sum([self.pitchlist[j] for j in i if j in self.pitchlist]), int(re.findall("[0-9]+",i)[0])) for i in l_]
         if self.option["intervalunit"]:
             l = [(i[0], ChordInterval[i[1]]) for i in l]
         def _fun(chord:List[int]):
-            return [i[0]+chord[i[1]] for i in l if i[1] < len(chord)]
+            return [i[0]+chord[i[1]-1] for i in l if i[1] <= len(chord)]
         self.chordmap[name] = _fun
+        print("chord_map:", name, l, file=sys.stderr)
 
     def chord_main(self, pitch:str, name:str):
         """
@@ -450,6 +473,7 @@ class compiler:
         """
         pitch_add = sum([self.pitchlist[i] for i in pitch if i in self.pitchlist])
         self.trclist[self.trackname]["chord"] = [j+pitch_add for j in self.chordlist[name]]
+        print("chord_main:", self.trclist[self.trackname]["chord"], file=sys.stderr)
 
     def parse(self, input_:str, *, directories=None):
         """
@@ -513,6 +537,7 @@ class compiler:
         s = self.delete_comment(input_)
         s = self.include(s, directories=directories)
         s = self.func_replace(s)
+        print(s, file=sys.stderr)
 
         tokens = [
             ("func", r"(?P<name>[a-zA-Z0-9]*)\[(?P<input>[^\]]+)\]"),
@@ -569,10 +594,10 @@ class compiler:
         self.trackname = trackname
 
     def method(self, input_:str):
-        self.barbeat, self.bpm, self.base = [int(i) for i in input_.split(",")] # TODO: bpm could be float?
+        self.barbeat, self.bpm, self.base = [eval(i) for i in input_.split(",")]
 
     def volume(self, volume:str):
-        self.track_set("volume", float(volume))
+        self.track_set("volume", self.eval(volume))
 
     def instrument(self, instrument:str):
         self.track_set("instrument", instrument)
@@ -587,7 +612,10 @@ def test(filename, *, directories=None):
     c = compiler()
     s = c.import_(filename, directories=directories)
 
-    print([i for i in c.parse(s, directories=directories) if i is not None])
+    for i in c.parse(s, directories=directories):
+        if i is not None:
+            print(i)
 
 if __name__ == "__main__":
     test("AlphaChord-Demo.txt", directories=["SMSP-Compiler-For-Mathematica"])
+    # test("test-macro.txt")
