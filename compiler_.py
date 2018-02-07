@@ -180,24 +180,23 @@ class compiler:
         FReplace[string_]:=StringReplace[
           string,
           {
-            Shortest[
-              name:WordCharacter..~~leftfun~~input:(WordCharacter|",")...~~rightfun~~leftdef~~output___~~rightdef]:>
-                (
-                  parlist=StringCases[input,par:WordCharacter..:>{par,ToExpression[par]}];
-                  pattern=Riffle[Pattern[#,__]/;InputQ[#]&/@parlist[[;;,2]],","]/.List->StringExpression;
-                  AssociateTo[flist,name->pattern:>#]&@StringReplace[FReplace[output],#1->#2&@@@parlist];
-                  ""
-                ),
-              Shortest[name:WordCharacter..~~leftdef~~output___~~rightdef]:>
-                (AssociateTo[dlist,name->FReplace[output]];""),
-              name:WordCharacter..~~leftfun~~input:Except[WhitespaceCharacter]...~~rightfun:>
-                If[
-                  KeyExistsQ[flist,name],
-                  FReplace@StringReplace[input,flist[name]],
-                  name~~leftfun~~input~~rightfun
-                ],
-              name:WordCharacter..:>(name/.dlist)
-            }];
+            Shortest[name:WordCharacter..~~leftfun~~input:(WordCharacter|",")...~~rightfun~~leftdef~~output___~~rightdef]:>
+              (
+                parlist=StringCases[input,par:WordCharacter..:>{par,ToExpression[par]}];
+                pattern=Riffle[Pattern[#,__]/;InputQ[#]&/@parlist[[;;,2]],","]/.List->StringExpression;
+                AssociateTo[flist,name->pattern:>#]&@StringReplace[FReplace[output],#1->#2&@@@parlist];
+                ""
+              ),
+            Shortest[name:WordCharacter..~~leftdef~~output___~~rightdef]:>
+              (AssociateTo[dlist,name->FReplace[output]];""),
+            name:WordCharacter..~~leftfun~~input:Except[WhitespaceCharacter]...~~rightfun:>
+              If[
+                KeyExistsQ[flist,name],
+                FReplace@StringReplace[input,flist[name]],
+                name~~leftfun~~input~~rightfun
+              ],
+            name:WordCharacter..:>(name/.dlist)
+          }];
         """
         # TODO: [] match (not use regex)
         tokens = [
@@ -258,36 +257,19 @@ class compiler:
             return [element]
         return [self.base + i + pitch_add if isinstance(i, int) else i for i in r]
 
-    def note_span(self, beat:str):
-        """
-        NoteSpan[beat_]:=
-          TrackAddTo["pointertime", 60barbeat/bpm StringCount[beat,rightbar]];
-        """
-        self.track_add_to("pointertime", 60*self.barbeat/self.bpm*len([i for i in beat if i in ")"]))
-
     def note_beat(self, beat:str):
         """
-        NoteBeat[beat_]:=If[#==={},1,Total[#-UnitStep[#-2]]+UnitStep[#[[1]]-2]]&@StringCases[beat,beatlist];
+        NoteBeat[beat_]:=
+          If[
+            #==={},
+            1,
+            Total[#-UnitStep[#-2]]+UnitStep[#[[1]]-2]
+          ]&@StringCases[beat,beatlist];
         """
         t = [self.beatlist[i] for i in beat if i in self.beatlist]
         if len(t) == 0:
             return 1
         return sum([i if i<2 else i-1 for i in t]) + (1 if t[0]==2 else 0)
-
-    def note_hold(self, hold:str, beatvalue:float, starttime:float):
-        """
-        NoteHold[hold_,beatvalue_,starttime_]:=
-          If[
-            NowTrack[]["holdmode"]=="pedal"||StringContainsQ[hold,holdstart],
-            (* fixed fermata *)
-            trackname<>" "<>ToString[NowTrack[]["holdcount"]+1]-First[starttime],
-            (* non-fixed fermata *)
-            1/bpm 60Max[Total@StringCases[hold,fixedholdlist],beatvalue]];
-        """
-        if self.now_track()["holdmode"] == "pedal" or self.symbols["holdstart"] in hold:
-            return lambda l: l[(self.trackname, self.now_track()["holdcount"]+1)] - starttime
-        else:
-            return 60/self.bpm*max((sum([self.fixedholdlist[i] for i in hold if i in self.fixedholdlist]), beatvalue))
 
     def note_force(self, force:str):
         """
@@ -303,6 +285,28 @@ class compiler:
         for i in f:
             p*=i
         return p
+
+    def note_hold(self, hold:str, beatvalue:float, starttime:float):
+        """
+        NoteHold[hold_,beatvalue_,starttime_]:=
+          If[
+            NowTrack[]["holdmode"]=="pedal"||StringContainsQ[hold,holdstart],
+            (* non-fixed fermata *)
+            trackname<>" "<>ToString[NowTrack[]["holdcount"]+1]-First[starttime],
+            (* fixed fermata *)
+            1/bpm 60Max[Total@StringCases[hold,fixedholdlist],beatvalue]];
+        """
+        if self.now_track()["holdmode"] == "pedal" or self.symbols["holdstart"] in hold:
+            return lambda l: l[(self.trackname, self.now_track()["holdcount"]+1)] - starttime
+        else:
+            return 60/self.bpm*max((sum([self.fixedholdlist[i] for i in hold if i in self.fixedholdlist]), beatvalue))
+
+    def note_span(self, beat:str):
+        """
+        NoteSpan[beat_]:=
+          TrackAddTo["pointertime", 60barbeat/bpm StringCount[beat,rightbar]];
+        """
+        self.track_add_to("pointertime", 60*self.barbeat/self.bpm*len([i for i in beat if i in ")"]))
 
     def note(self, force, pitch, element, beat, hold):
         """
@@ -333,6 +337,41 @@ class compiler:
             starttime = self.now_track()["starttime"]
             self.track_add_to("starttime", 60*beatvalue/self.bpm)
             return starttime, self.note_pitch(pitch, element), self.note_hold(hold, beatvalue, starttime), self.note_force(force), self.now_track()["instrument"], self.now_track()["volume"]
+
+
+    def bar_main(self):
+        """
+        BarMain[]:=
+          (
+            If[
+              MemberQ[{"normal","pedal"},NowTrack[]["holdmode"]],
+              FreeHoldMain[]
+            ];
+            TrackSet[
+              "starttime",
+              TrackAddTo["pointertime",60barbeat/bpm]
+            ];
+            Nothing);
+        """
+        if self.now_track()["holdmode"] in ["normal", "pedal"]:
+            self.freeholdmain()
+        self.track_add_to("pointertime", 60*self.barbeat/self.bpm)
+        self.track_set("starttime", self.now_track()["pointertime"])
+
+    def section(self, input_:str):
+        """
+        Bar[input_]:=
+          (
+            TrackSet[
+              "starttime",
+              TrackSet[
+                "pointertime",
+                60barbeat/bpm ToExpression["{"<>input<>"}"]]];
+            Nothing
+          );
+        """
+        self.track_set("pointertime", 60*self.barbeat/self.bpm*float(input_))
+        self.track_set("starttime", self.now_track()["pointertime"])
 
     def freehold(self, input_:str):
         """
@@ -371,40 +410,6 @@ class compiler:
         """
         self.track_add_to("holdcount", 1)
         self.freeholdlist[(self.trackname, self.now_track()["holdcount"])] = self.now_track()["starttime"]
-
-    def bar_main(self):
-        """
-        BarMain[]:=
-          (
-            If[
-              MemberQ[{"normal","pedal"},NowTrack[]["holdmode"]],
-              FreeHoldMain[]
-            ];
-            TrackSet[
-              "starttime",
-              TrackAddTo["pointertime",60barbeat/bpm]
-            ];
-            Nothing);
-        """
-        if self.now_track()["holdmode"] in ["normal", "pedal"]:
-            self.freeholdmain()
-        self.track_add_to("pointertime", 60*self.barbeat/self.bpm)
-        self.track_set("starttime", self.now_track()["pointertime"])
-
-    def section(self, input_:str):
-        """
-        Bar[input_]:=
-          (
-            TrackSet[
-              "starttime",
-              TrackSet[
-                "pointertime",
-                60barbeat/bpm ToExpression["{"<>input<>"}"]]];
-            Nothing
-          );
-        """
-        self.track_set("pointertime", 60*self.barbeat/self.bpm*float(input_))
-        self.track_set("starttime", self.now_track()["pointertime"])
 
     def chord_def(self, name:str, input_:str):
         """
