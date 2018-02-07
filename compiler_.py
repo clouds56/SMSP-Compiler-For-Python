@@ -1,8 +1,9 @@
 import os, re, sys
+from typing import Dict, Tuple, List, Union, Callable
 
 """CMajor={"C"->0,"D"->2,"E"->4,"F"->5,"G"->7,"A"->9,"B"->11};"""
 CMajor={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
-ChordInterval=[1,2,2,2,3,4,4,1,5,2,6,3,7,4];
+ChordInterval:List[int]=[1,2,2,2,3,4,4,1,5,2,6,3,7,4]
 
 def name_to_number(name:str) -> int:
     """
@@ -66,7 +67,7 @@ class compiler:
     trclist={trackname: deftrack};
     """
     def __init__(self):
-        self.sample={"1": 0,"2": 2,"3": 4,"4": 5,"5": 7,"6": 9,"7": 11},
+        self.scale={"1": 0, "2": 2, "3": 4, "4": 5, "5": 7, "6": 9, "7": 11}
         self.pitchlist={"@": -1,"#": 1,"!": -12,"^": 12}
         self.beatlist={"$": 1/8,"=": 1/4,";": 1/3,"_": 1/2,":": 2/3,".": 3/2,"-": 2}
         self.forcelist={"\"": 0.25,"'": 0.5,"+": 2,"*": 4}
@@ -100,18 +101,21 @@ class compiler:
             "chord": [0, 4, 7],
             "holdcount": 0,
             "holdmode": "default",
-            "pointertime": [0],
-            "starttime": [0],}
+            "pointertime": 0,
+            "starttime": 0,}
 
         self.option = {
             "chordextend": True,
             "intervalunit": False,
         }
         self.flist = {}
-        self.chordlist = {}
-        self.chordmap = {}
+        self.chordlist:Dict[str, List[Union[int, str]]] = {}
+        self.chordmap:Dict[str, Callable[[List[int]],List[int]]] = {}
         self.trclist = {}
         self.trackname = ""
+        self.barbeat = 4
+        self.bpm = 120
+        self.base = 0
 
     def now_track(self):
         """NowTrack[]:=trclist[trackname];"""
@@ -129,18 +133,20 @@ class compiler:
         """DeleteComment[input_]:=StringDelete[input,comment~~Except["\n"]..|""];"""
         return re.sub(self.symbols["comment"]+"[^\n]*", "", input_)
 
-    def import_(self, filename:str, *, directories=[]) -> str:
+    def import_(self, filename:str, *, directories=None) -> str:
         try:
             with open(filename) as f:
                 return self.delete_comment(f.read())
         except:
+            if directories == None or len(directories) == 0:
+                raise
             for i in directories:
                 try:
                     return self.import_(os.path.join(i, filename))
                 except:
                     pass
 
-    def include(self, input_:str, *, directories=[]) -> str:
+    def include(self, input_:str, *, directories=None) -> str:
         """
         Include[input_]:=StringReplace[
           DeleteComment[input],
@@ -213,6 +219,115 @@ class compiler:
         self.flist[name] = func
         return ""
 
+    def note_pitch(self, pitch:str, element:str):
+        """
+        NotePitch[pitch_,element_]:=
+          Total@StringCases[pitch,pitchlist]+
+          Flatten@{
+            If[
+              KeyExistsQ[chordmap,element],
+              Cases[chordmap[element][NowTrack[]["chord"]],_Integer],
+              element/.scale]}+
+          base/.Plus[n_,s_String]:>s;
+        """
+        pitch_add = sum([self.pitchlist[i] for i in pitch if i in self.pitchlist])
+        if element in self.chordmap:
+            r = [i for i in self.chordmap[element](self.now_track()["chord"]) if isinstance(i, int)]
+        else:
+            r = [self.scale[i] for i in element]
+        return [self.base + i + pitch_add for i in r]
+
+    def note_span(self, beat:str):
+        """
+        NoteSpan[beat_]:=
+          TrackAddTo["pointertime", 60barbeat/bpm StringCount[beat,rightbar]];
+        """
+        self.track_add_to("pointertime", 60*self.barbeat/self.bpm*len([i for i in beat if i in ")"]))
+
+    def note_beat(self, beat:str):
+        """
+        NoteBeat[beat_]:=If[#==={},1,Total[#-UnitStep[#-2]]+UnitStep[#[[1]]-2]]&@StringCases[beat,beatlist];
+        """
+        t = [self.beatlist[i] for i in beat if i in self.beatlist]
+        return sum([i if i<2 else i-1 for i in t]) + (1 if t[0]==2 else 0)
+
+    def note_hold(self, hold:str, starttime:float):
+        """
+        NoteHold[hold_,beatvalue_,starttime_]:=
+          If[
+            NowTrack[]["holdmode"]=="pedal"||StringContainsQ[hold,holdstart],
+            (* fixed fermata *)
+            trackname<>" "<>ToString[NowTrack[]["holdcount"]+1]-First[starttime],
+            (* non-fixed fermata *)
+            1/bpm 60Max[Total@StringCases[hold,fixedholdlist],beatvalue]];
+        """
+        if self.now_track()["holdmode"] == "pedal" or self.symbols["holdstart"] in hold:
+            "%s_%d"%(self.trackname, self.now_track()["holdcount"]+1) - starttime
+
+    def note(self, force, pitch, element, beat, hold):
+        """
+        Note[force_,pitch_,element_,beat_,hold_]:=
+          Module[{starttime,beatvalue},
+            NoteSpan[beat];
+            If[
+              element==rest,
+              TrackAddTo["starttime",60 NoteBeat[beat]/bpm];Nothing,
+              beatvalue=NoteBeat[beat];
+              starttime=NowTrack[]["starttime"];
+              TrackAddTo["starttime",60beatvalue/bpm];
+              {
+                starttime,
+                NotePitch[pitch,element],
+                NoteHold[hold,beatvalue,starttime],
+                NoteForce[force],
+                NowTrack[]["instrument"],
+                NowTrack[]["volume"]
+              }]];
+        """
+        self.note_span(beat) # TODO: why?
+
+        beatvalue = self.note_beat(beat)
+        if element == self.symbols["rest"]:
+            self.track_add_to("starttime", 60*beatvalue/self.bpm)
+        else:
+            starttime = self.now_track()["starttime"]
+            self.track_add_to("starttime", 60*beatvalue/self.bpm)
+            return starttime, self.note_pitch(pitch, element), self.note_hold(hold, beatvalue, starttime), self.note_force(force), self.now_track()["instrument"], self.now_track()["volume"]
+
+    def freeholdmain(self):
+        """
+        FreeHoldMain[]:=
+          (
+            TrackAddTo["holdcount",1];
+            AssociateTo[
+              freeholdlist,
+              trackname<>" "<>ToString[NowTrack[]["holdcount"]]->
+                First[NowTrack[]["starttime"]]];
+            Nothing
+          )
+        """
+        self.track_add_to("holdcount", 1)
+        self.freeholdlist["%s_%d" % (self.trackname, self.now_track()["holdcount"])] = self.now_track()["starttime"][0]
+
+    def bar_main(self):
+        """
+        BarMain[]:=
+          (
+            If[
+              MemberQ[{"normal","pedal"},NowTrack[]["holdmode"]],
+              FreeHoldMain[]
+            ];
+            TrackSet[
+              "starttime",
+              TrackAddTo["pointertime",60barbeat/bpm]
+            ];
+            Nothing);
+        """
+        if self.now_track()["holdmode"] in ["normal", "pedal"]:
+            self.freeholdmain()
+        self.track_add_to("pointertime", 60*self.barbeat/self.bpm)
+        self.track_set("starttime", self.now_track()["pointertime"])
+
     def chord_def(self, name:str, input_:str):
         """
         ChordDef[name_,input_]:=
@@ -259,11 +374,11 @@ class compiler:
                       element_/;element[[2]]<=Length[chord]]]];
             Nothing];
         """
-        l = [x.strip() for x in input_.split(",")]
-        l = [(sum([self.chordlist[j] for j in i if j in self.chordlist]), int(re.findall("[0-9]+",i)[0])) for i in l]
+        l_ = [x.strip() for x in input_.split(",")]
+        l = [(sum([self.pitchlist[j] for j in i if j in self.chordlist]), int(re.findall("[0-9]+",i)[0])) for i in l_]
         if self.option["intervalunit"]:
             l = [(i[0], ChordInterval[i[1]]) for i in l]
-        def _fun(chord):
+        def _fun(chord:List[int]):
             return [i[0]+chord[i[1]] for i in l if i[1] <= len(chord)]
         self.chordmap[name] = _fun
 
@@ -275,20 +390,144 @@ class compiler:
             Total@StringCases[pitch,pitchlist]+name/.chordlist];
           Nothing);
         """
-        self.trclist[self.trackname]["chord"] = self.chordlist[name] + sum([self.pitchlist[i] for i in pitch if i in self.pitchlist])
+        pitch_add = sum([self.pitchlist[i] for i in pitch if i in self.pitchlist])
+        self.trclist[self.trackname]["chord"] = [j+pitch_add for j in self.chordlist[name]]
+
+    def parse(self, input_:str, *, directories=None):
+        """
+        StringCases[
+          FReplace@Fold[
+            StringReplace[#1,#2]&,
+            Include[test],
+            {
+              s:Except[WordCharacter|WhitespaceCharacter|holdend]~~Whitespace:>s,
+              Whitespace~~s:Except[WordCharacter|WhitespaceCharacter|leftfun]:>s,
+              {
+                rightfun~~c:Except[rightfun|split|leftdef]:>rightfun~~" "~~c,
+                split->","
+              }
+            }
+          ],
+          {
+            name:WordCharacter...~~leftfun~~input:Except[WhitespaceCharacter]...~~rightfun:>
+              Switch[
+                name,
+                (* track *)
+                "",Track[input],
+                (* method *)
+                mtdset,Method[input],
+                (* volume *)
+                volset,Volume[input],
+                (* instrument *)
+                insset,Instrument[input]
+              ],
+
+            (* main bar *)
+            mainbar:>BarMain[],
+
+            (* section *)
+            Shortest[leftbar~~input___~~rightbar]:>Bar[input],
+
+            (* fermata *)
+            Shortest[holdend~~leftfun~~input___~~rightfun]:>FreeHold[input],
+
+            (* main fermata *)
+            holdend:>FreeHoldMain[],
+
+            (* chord *)
+            Shortest[name:WordCharacter...~~leftchord~~input___~~rightchord]:>
+              If[
+                name==""||UpperCaseQ@StringPart[name,1],
+                (* chord define *)
+                ChordDef[name,input],
+                (* chord map *)
+                ChordMap[name,input]],
+
+            (* main chord *)
+            Shortest[pitch:pitchpat...~~name:WordCharacter...~~rightchord]:>ChordMain[pitch,name],
+
+            (* note *)
+            force:forcepat...~~pitch:pitchpat...~~element:WordCharacter..~~beat:beatpat...~~hold:holdpat...:>
+              Note[force,pitch,element,beat,hold]
+          }
+        ]/.freeholdlist
+        """
+        s = self.delete_comment(input_)
+        s = self.include(s, directories=directories)
+        s = self.func_replace(s)
+
+        tokens = [
+            ("func", r"(?P<name>[a-zA-Z0-9]+)\[(?P<input>[^\]]+)\]"),
+            ("bar", r"\|"),
+            ("section", r"\((?P<input>[0-9]+)\)"),
+            ("fermata", r"&\[(?P<input>[^\]]+)\]"),
+            ("fermatemain", r"&"),
+            ("chord", r"(?P<name>[0-9a-zA-Z]+)?<(?P<input>[^>]+)>"),
+            ("chordmain", r"(?P<pitch>[%s]+)?(?P<name>[a-zA-Z0-9]+)?>" % re.escape("".join(self.pitchlist.keys()))),
+            ("note", r"(?P<force>[%s]+)?(?P<pitch>[%s]+)?(?P<element>[0-9a-zA-Z]+)(?<beat>[%s]+)?(?P<hold>[%s]+)?" %
+             (re.escape("".join(self.forcelist.keys())), re.escape("".join(self.pitchlist.keys())),
+              re.escape("".join(self.beatlist.keys())+")"), re.escape("".join(self.fixedholdlist.keys())+"`")))
+        ]
+
+        tokens = [(i, v.replace("?P<", "?P<"+i+"_")) for i, v in tokens]
+
+        for m in re.finditer("|".join(["(?P<%s_>%s)"%i for i in tokens]), s):
+            kind = m.lastgroup
+            if kind == "func_":
+                name, input_ = m.group(kind+"name"), m.group(kind+"input")
+                if name == "":
+                    yield self.track(input_)
+                elif name == self.symbols["mtdset"]:
+                    yield self.method(input_)
+                elif name == self.symbols["volset"]:
+                    yield self.volume(input_)
+                elif name == self.symbols["insset"]:
+                    yield self.instrument(input_)
+                else:
+                    print("WARN unknown function: %s" % name)
+            elif kind == "bar_":
+                yield self.bar_main()
+            elif kind == "section_":
+                yield self.section(m.group(kind+"_input"))
+            elif kind == "fermata_":
+                yield self.freehold(m.group(kind+"_input"))
+            elif kind == "fermatamain_":
+                yield self.freeholdmain()
+            elif kind == "chord_":
+                name, input_ = m.group(kind+"name"), m.group(kind+"input")
+                if name == "" or name[0].isupper():
+                    yield self.chord_def(name, input_)
+                else:
+                    yield self.chord_map(name, input_)
+            elif kind == "chordmain_":
+                yield self.chord_main(m.group(kind+"pitch"), m.group(kind+"name"))
+            elif kind == "note_":
+                force, pitch, element, beat, hold = m.group(kind+"force"),m.group(kind+"pitch"), m.group(kind+"element"), m.group(kind+"beat"), m.group(kind+"hold")
+                yield self.note(force, pitch, element, beat, hold)
+
+    def track(self, trackname:str):
+        self.trackname = trackname
+
+    def method(self, input_:str):
+        self.barbeat, self.bpm, self.base = [int(i) for i in input_.split(",")] # TODO: bpm could be float?
+
+    def volume(self, volume:str):
+        self.track_set("volume", float(volume))
+
+    def instrument(self, instrument:str):
+        self.track_set("instrument", instrument)
 
 
 
 
 
-def test(filename, *, directories=[]):
+
+
+def test(filename, *, directories=None):
     c = compiler()
     s = c.import_(filename, directories=directories)
 
-    s = c.delete_comment(s)
-    s = c.include(s, directories=directories)
-    s = c.func_replace(s)
-    print(s)
+    print(list(c.parse(s, directories=directories)))
 
 if __name__ == "__main__":
     test("AlphaChord-Demo.txt", directories=["SMSP-Compiler-For-Mathematica"])
