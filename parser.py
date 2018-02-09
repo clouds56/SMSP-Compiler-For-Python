@@ -35,7 +35,7 @@ BAR: "|"
 FORCE: """ + to_token(forcelist) + """
 PITCH: """ + to_token(pitchlist) + """
 BEAT: """ + to_token(beatlist) + """
-HOLD: """ + to_token(list(fixedholdlist) + ["`"]) + """
+HOLD: """ + to_token(fixedholdlist) + """
 HOLD_END: "&"
 
 CNAME: LETTER | DIGIT
@@ -53,7 +53,7 @@ item: name | number
 force: FORCE+
 pitch: PITCH+
 beat: BEAT+
-hold: HOLD+
+hold: HOLD+ | "`"
 
 bar: BAR
 chord_param: pitch? item
@@ -63,7 +63,8 @@ section: "(" number ("," number)* ")"
 note_main: int
          | name -> chord_instance
          | chord_params -> chord_const
-note: force? pitch? note_main beat? hold? HOLD_END?
+note: force? pitch? note_main beat? hold?
+hold_end: HOLD_END
 ?funcparam: funccall | item
 ?funccall: FUNC_CALL funcparam? ("," funcparam)* "]" -> funccall
 holdmode: "&[" item "]"
@@ -76,6 +77,7 @@ statement: funccall
          | chord
          | section
          | bar
+         | hold_end
          | note
 smsp: statement*
 
@@ -95,8 +97,9 @@ smsp: statement*
 # In[6]:
 
 
-from typing import List, Union
+from typing import List, Dict, Tuple, Union, Iterable, Callable, Optional
 import sys
+import collections
 
 
 # In[7]:
@@ -120,12 +123,18 @@ def get_item(x: (lark.Tree, lark.lexer.Token)) -> Union[int, str]:
     print(x)
     assert(False)
 
+def yield_from(l):
+    yield from l
+
+def gather_from(l):
+    for i in l:
+        yield from i
 
 # In[8]:
 
 
 class AdditiveMap():
-    def __init__(self, l, default=1):
+    def __init__(self, l, default):
         self.name = "add_map"
         self.map = l
         self.dft = default
@@ -141,13 +150,13 @@ class AdditiveMap():
     def __repr__(self):
         return "<%s %s %s>" % (self.name, self.s, self.get_value())
     
-    def __add__(self, i):
-        assert(self.name == i.name)
-        return self.__class__(self.s + i.s)
+    def __add__(self, o):
+        assert(self.name == o.name)
+        return self.__class__(self.s + o.s)
 
 class Force(AdditiveMap):
     def __init__(self, s=""):
-        super().__init__(forcelist)
+        super().__init__(forcelist, 1)
         self.name = "force"
         self.s = s
 
@@ -159,29 +168,61 @@ class Pitch(AdditiveMap):
 
 class Beat(AdditiveMap):
     def __init__(self, s=""):
-        super().__init__(beatlist)
+        super().__init__(beatlist, 1)
         self.name = "beat"
         self.s = s
     
     def get_value(self, s=None):
         if s is None:
             s = self.s
-        return super().get_value(s) + (1 if len(s) > 0 and s[0] == "-" else 0)
+        return super().get_value(s) + (1 if s is not None and len(s) > 0 and s[0] == "-" else 0)
 
-class FixedHold(AdditiveMap):
+class Hold:
+    def __init__(self, fixed=None):
+        self.fixed = fixed
+
+    def get_value(self):
+        if self.fixed is False:
+            return "?"
+        return None
+
+class FixedHold(AdditiveMap, Hold):
     def __init__(self, s=""):
-        super().__init__(fixedholdlist, 0)
+        super().__init__(fixedholdlist, default=0)
+        Hold.__init__(self, fixed=True)
         self.name = "hold"
         self.s = s
 
-class Statement:
+    def get_value(self, s=None) -> (Optional[str], float):
+        return super().get_value(s)
+
+class IR:
     def __init__(self, line_begin=-1, line_end=-1):
         self.line_begin = line_begin
         self.line_end = line_end
 
-class Func(Statement):
-    def __init__(self, s, line_begin, line_end):
-        super().__init__(line_begin, line_end)
+class Control(IR):
+    def __init__(self, name, value):
+        super().__init__()
+        self.name = name
+        self.value = value
+
+    def __repr__(self):
+        return "<control %s=%s>" % (self.name, self.value)
+
+class Section(IR):
+    def __init__(self, value=None, *, relative=False):
+        super().__init__()
+        if value is None:
+            value = 1 if relative else 0
+        self.value = value
+        self.relative = relative
+
+    def __repr__(self):
+        return "<section %s%s>" % ("+" if self.relative else "", self.value)
+
+class Func:
+    def __init__(self, s):
         self.name = s
         self.args = None
     
@@ -191,125 +232,190 @@ class Func(Statement):
     
     def __repr__(self):
         return "<func %s %s>" % (self.name, self.args or "")
-    
+
+class ChordDef(IR):
+    def __init__(self, name, args):
+        super().__init__()
+        self.name = name
+        self.args = tuple(args)
+
+    def __repr__(self):
+        return "<chord_def %s %s>" % (self.name, self.args)
+
+class ChordMap(IR):
+    def __init__(self, name, args):
+        super().__init__()
+        self.name = name
+        self.args = tuple(args)
+
+    def __repr__(self):
+        return "<chord_map %s %s>" % (self.name, self.args)
+
+class Note(IR):
+    def __init__(self, note, force: Force, pitch: Pitch, beat: Beat, hold: Hold):
+        super().__init__()
+        self.type, self.note = note
+        self.force = force
+        self.pitch = pitch
+        self.beat = beat
+        self.hold = hold
+
+    def __repr__(self):
+        h = self.hold.get_value()
+        return "<note %s f=%s,p=%s,b=%s%s>" % (self.note, self.force.get_value(), self.pitch.get_value(), self.beat.get_value(), ("h="+h) if h is not None else "")
+
+class HoldEnd(IR):
+    def __init__(self, value=None):
+        super().__init__()
+        self.value = value
+
+    def __repr__(self):
+        return "<hold_end>" if self.value is None else "<hold_end %s>" % self.value
+
 class transformer(lark.Transformer):
     @staticmethod
-    def statement(args):
-        [stat] = args
+    def statement(items):
+        [stat] = items
         if stat is not None:
-            print("statement", stat)
+            if isinstance(stat, collections.Iterable):
+                yield from(stat)
+            elif isinstance(stat, IR):
+                yield stat
+            else:
+                print("unknown statement ", stat)
         
     @staticmethod
-    def chord(args):
-        [name, params] = args
+    def chord(items):
+        [name, params] = items
+        if name == "" or name[0].isupper():
+            yield ChordDef(name, params)
+        else:
+            yield ChordMap(name, params)
         # print("chord", name, params)
 
     @staticmethod
-    def funccall(args):
-        [name, *params] = args
+    def funccall(items):
+        [name, *params] = items
         name: str = name[:-1]
         if name == "i":
-            pass
+            return yield_from([Control("instrument", params[0])])
         elif name == "m":
-            pass
+            return yield_from([Control(v, params[i]) for i, v in enumerate(["barbeat", "bpm", "base"])])
         elif name == "v":
-            pass
+            return yield_from([Control("volume", params[0])])
         else:
             # print("*funccall", name, params)
             return Func(name).bind(params)
-        print("funccall", name, params)
 
     @staticmethod
-    def funcparam(args):
-        [i] = args
+    def funcparam(items):
+        [i] = items
         # print("funcparam", i, file=sys.stderr)
         return i
     
     @staticmethod
-    def switch_track(args):
-        [name] = args
-        print("switch_track", name)
+    def switch_track(items):
+        [name] = items
+        yield Control("track", name)
 
     @staticmethod
-    def switch_chord(ch):
-        print("switch_chord", ch)
+    def switch_chord(items):
+        ch = tuple(items)
+        yield Control("chord", ch)
         
     @staticmethod
-    def section(args):
-        secs = args
-        print("section", secs)
+    def section(items):
+        secs = tuple(items)
+        yield Section(secs)
     
     @staticmethod
-    def bar(args):
-        print("bar")
+    def bar(items):
+        yield Section(relative=True)
 
     @staticmethod
-    def note(args):
-        force, pitch, note, beat, hold, hold_end = Force(), Pitch(), None, Beat(), FixedHold(), False
-        for i in args:
+    def hold_end(items):
+        yield HoldEnd()
+
+    @staticmethod
+    def holdmode(items):
+        [i] = items
+        if i in freeholdrule:
+            i = freeholdrule[i]
+        if i in freeholdrule.values():
+            yield Control("holdmode", i)
+        elif isinstance(i, (float, int)):
+            yield HoldEnd(i)
+        else:
+            assert(False)
+
+    @staticmethod
+    def note(items):
+        force, pitch, note, beat, hold = Force(), Pitch(), None, Beat(), Hold()
+        for i in items:
             if isinstance(i, Force):
                 force = i
             elif isinstance(i, Pitch):
                 pitch = i
             elif isinstance(i, Beat):
                 beat = i
-            elif isinstance(i, FixedHold):
+            elif isinstance(i, Hold):
                 hold = i
             elif isinstance(i, lark.Tree):
-                note = i
-            elif isinstance(i, lark.lexer.Token) and i.type == "HOLD_END":
-                hold_end = True
-        # print("note", note, force, pitch, beat, hold, hold_end)
+                note = (i.data, i.children[0])
+        yield Note(note, force=force, pitch=pitch, beat=beat, hold=hold)
+        # print("note", note, force, pitch, beat, hold)
     
     @staticmethod
-    def chord_params(args):
-        return args
+    def chord_params(items):
+        return items
     
     @staticmethod
-    def chord_param(args):
+    def chord_param(items):
         # TODO
-        if len(args) == 1:
-            return args[0]
+        if len(items) == 1:
+            return items[0]
         else:
-            return args
+            return sum(items[:-1], Pitch()), items[-1]
 
     @staticmethod
-    def item(args):
-        return args[0]
+    def item(items):
+        return items[0]
     
     @staticmethod
-    def name(args):
-        [x] = args
+    def name(items):
+        [x] = items
         return x.value
 
     @staticmethod
-    def number(args):
-        [x] = args
+    def number(items):
+        [x] = items
         try:
             return int(x.value)
         except ValueError:
             return float(x.value)
         
     @staticmethod
-    def int(args):
-        [x] = args
+    def int(items):
+        [x] = items
         return int(x.value)
 
     @staticmethod
-    def force(args) -> Force:
-        return sum([Force(x.value) for x in args], Force())
+    def force(items) -> Force:
+        return sum([Force(x.value) for x in items], Force())
 
     @staticmethod
-    def pitch(args) -> Pitch:
-        return sum([Pitch(x.value) for x in args], Pitch())
+    def pitch(items) -> Pitch:
+        return sum([Pitch(x.value) for x in items], Pitch())
     
     @staticmethod
-    def beat(args) -> Beat:
-        return sum([Beat(x.value) for x in args], Beat())
+    def beat(items) -> Beat:
+        return sum([Beat(x.value) for x in items], Beat())
 
     @staticmethod
-    def hold(args) -> FixedHold:
-        return sum([FixedHold(x.value) for x in args], FixedHold())
+    def hold(items) -> Hold:
+        if len(items) == 0:
+            return Hold(fixed=False)
+        return sum([FixedHold(x.value) for x in items], FixedHold())
 
 # In[9]:
 
@@ -326,9 +432,147 @@ def test():
 
 # In[10]:
 
+class Timeline:
+    def __init__(self, i):
+        if isinstance(i, (list, tuple)):
+            self.i = tuple(i)
+        elif isinstance(i, (int, float)):
+            self.i = (i,)
+        else:
+            raise Exception("not supported type")
+
+    def __add__(self, o):
+        if isinstance(o, (int, float)):
+            # print("__add__", self.i, o)
+            return Timeline([x+o for x in self.i])
+        else:
+            raise Exception("not supported type")
+
+    def __iadd__(self, o):
+        if isinstance(o, (int, float)):
+            # print("__iadd__", self.i, o)
+            self.i = tuple(x+o for x in self.i)
+            return self
+        else:
+            raise Exception("not supported type")
+
+    def __copy__(self):
+        # print("__copy__", self.i)
+        return Timeline(self.i)
+
+class Track:
+    def __init__(self):
+        self.instrument = "Midi[1]"
+        self.volume = 1.
+        self.chord = (Pitch(), ChordDef("", (0, 4, 7)))
+        self.holdcount = 0
+        self.holdmode = "default"
+        self.pointertime = Timeline(0.)
+        self.starttime = Timeline(0.)
+
+class VM:
+    def __init__(self):
+        self.chordlist: Dict[str, ChordDef] = {}
+        self.chordmap: Dict[str, ChordMap] = {}
+        self.trackname: str = ""
+        self.tracklist = collections.defaultdict(Track)
+        self.barbeat: int = 4
+        self.bps: float = 120. / 60
+        self.base: int = 0
+        self.pending: List[Sound] = []
+
+    def cur_track(self) -> Track:
+        return self.tracklist[self.trackname]
+
+class Sound:
+    def __init__(self, track: str, starttime: (float, Tuple[float]), note: (List[int], str), type: str, force: float, beat: float, hold: (int, str)):
+        self.track = track
+        self.start = starttime
+        self.type = type
+        self.note = note
+        self.force = force
+        self.beat = beat
+        self.hold = hold
+
+    def __repr__(self):
+        return "<sound %s %s (%s) %s f=%s,b=%s,h=%s>" % (self.track, self.start, self.type, self.note, self.force, self.beat, self.hold)
+
+    @staticmethod
+    def from_note(note: Note, state: VM):
+        h = note.hold.get_value()
+        b = note.beat.get_value() / state.bps
+        if h is None and state.cur_track().holdmode == "pedal":
+            h = "?"
+        if isinstance(h, (int, float)):
+            h = h / state.bps
+        return Sound(state.trackname, state.cur_track().starttime.i, note.note,
+                     type=note.type, force=note.force.get_value(), beat=b, hold=h or 0)
+
+def gen_ast(txt: str) -> lark.Tree:
+    return parser.parse(txt)
+
+def gen_ir(ast: lark.Tree) -> Iterable[IR]:
+    yield from gather_from(transformer().transform(ast).children)
+
+def exec_ir(ir: Iterable[IR], *, state=None) -> Iterable[Sound]:
+    if state is None:
+        state = VM()
+    for i in ir:
+        if isinstance(i, Control):
+            if i.name == "volume":
+                state.cur_track().volume = float(i.value)
+            elif i.name == "instrument":
+                state.cur_track().instrument = i.value
+            elif i.name == "chord":
+                state.cur_track().chord = i.value if len(i.value) == 2 else (Pitch, i.value)
+            elif i.name == "holdmode":
+                state.cur_track().holdmode = i.value
+            elif i.name == "barbeat":
+                state.barbeat = int(i.value)
+            elif i.name == "bpm":
+                state.bps = float(i.value) / 60
+            elif i.name == "base":
+                state.base = int(i.value)
+            elif i.name == "track":
+                state.trackname = str(i.value)
+        elif isinstance(i, ChordDef):
+            state.chordlist[i.name] = i
+        elif isinstance(i, ChordMap):
+            state.chordmap[i.name] = i
+        elif isinstance(i, Section):
+            if i.relative:
+                state.cur_track().pointertime += i.value * state.barbeat / state.bps
+            else:
+                state.cur_track().pointertime = Timeline([x * state.barbeat / state.bps for x in i.value])
+            state.cur_track().starttime = state.cur_track().pointertime.__copy__()
+        elif isinstance(i, Note):
+            sound = Sound.from_note(i, state)
+            state.cur_track().starttime += sound.beat
+            if sound.hold == "?":
+                state.pending.append(sound)
+            else:
+                yield sound
+        if isinstance(i, HoldEnd) or (isinstance(i, Section) and state.cur_track().holdmode in ("pedal", "normal")):
+            if i.value is None:
+                cur_time = state.cur_track().starttime.i[0]
+            else:
+                cur_time = i.value * state.barbeat / state.bps
+            _pending = []
+            for s in state.pending:
+                if s.track == state.trackname:
+                    s.hold = cur_time - s.start[0]
+                    if s.hold < s.beat:
+                        s.hold = s.beat
+                    yield s
+                else:
+                    _pending.append(s)
+            state.pending = _pending
+
+
 
 if __name__ == "__main__":
     with open("tmp1.txt") as f:
         txt = f.read()
-    transformer().transform(parser.parse(txt));
+    for ii in exec_ir(gen_ir(gen_ast(txt))):
+        print(ii)
 
