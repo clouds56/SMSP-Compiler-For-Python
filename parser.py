@@ -16,6 +16,8 @@ beatlist={"$": 1/8,"=": 1/4,";": 1/3,"_": 1/2,":": 2/3,".": 3/2,"-": 1}
 forcelist={"\"": 0.25,"'": 0.5,"+": 2,"*": 4}
 fixedholdlist={"~": 2}
 freeholdrule={"d": "default","n": "normal","p": "pedal"}
+majorlist={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
+#ChordInterval:List[int]=[1,2,2,2,3,4,4,1,5,2,6,3,7,4]
 
 
 # In[3]:
@@ -58,11 +60,10 @@ hold: HOLD+ | "`"
 bar: BAR
 chord_param: pitch? item
 chord_params: "<" chord_param ("," chord_param)* ">"
-chord: name chord_params
+chord: name? chord_params
 section: "(" number ("," number)* ")"
 note_main: int
          | name -> chord_instance
-         | chord_params -> chord_const
 note: force? pitch? note_main beat? hold?
 hold_end: HOLD_END
 ?funcparam: funccall | item
@@ -139,17 +140,17 @@ class AdditiveMap():
         self.map = l
         self.dft = default
         self.s = ""
-    
+
     def get_value(self, s=None):
         if s is None:
             s = self.s
         if len(s) == 0:
             return self.dft
         return sum([self.map[i] for i in s])
-    
+
     def __repr__(self):
         return "<%s %s %s>" % (self.name, self.s, self.get_value())
-    
+
     def __add__(self, o):
         assert(self.name == o.name)
         return self.__class__(self.s + o.s)
@@ -171,7 +172,7 @@ class Beat(AdditiveMap):
         super().__init__(beatlist, 1)
         self.name = "beat"
         self.s = s
-    
+
     def get_value(self, s=None):
         if s is None:
             s = self.s
@@ -225,16 +226,16 @@ class Func:
     def __init__(self, s):
         self.name = s
         self.args = None
-    
+
     def bind(self, args):
         self.args = args
         return self
-    
+
     def __repr__(self):
         return "<func %s %s>" % (self.name, self.args or "")
 
 class ChordDef(IR):
-    def __init__(self, name, args):
+    def __init__(self, name: str, args: Iterable[Union[int, str]]):
         super().__init__()
         self.name = name
         self.args = tuple(args)
@@ -243,10 +244,10 @@ class ChordDef(IR):
         return "<chord_def %s %s>" % (self.name, self.args)
 
 class ChordMap(IR):
-    def __init__(self, name, args):
+    def __init__(self, name: str, args: Iterable[Union[int, Tuple[Pitch, int]]]):
         super().__init__()
         self.name = name
-        self.args = tuple(args)
+        self.args: Tuple[Tuple[Pitch, int], ...] = tuple((Pitch(), i) if isinstance(i, (int, float)) else i for i in args)
 
     def __repr__(self):
         return "<chord_map %s %s>" % (self.name, self.args)
@@ -283,12 +284,18 @@ class transformer(lark.Transformer):
                 yield stat
             else:
                 print("unknown statement ", stat)
-        
+
     @staticmethod
     def chord(items):
-        [name, params] = items
+        params = items[-1]
+        if len(items) > 1:
+            name = items[0]
+        else:
+            name = "U#" + str(tuple(params))
         if name == "" or name[0].isupper():
             yield ChordDef(name, params)
+            if name.startswith("U#"):
+                yield Control("chord", (Pitch(), name))
         else:
             yield ChordMap(name, params)
         # print("chord", name, params)
@@ -312,7 +319,7 @@ class transformer(lark.Transformer):
         [i] = items
         # print("funcparam", i, file=sys.stderr)
         return i
-    
+
     @staticmethod
     def switch_track(items):
         [name] = items
@@ -320,14 +327,16 @@ class transformer(lark.Transformer):
 
     @staticmethod
     def switch_chord(items):
-        ch = tuple(items)
-        yield Control("chord", ch)
-        
+        pitch, chord = Pitch(), items[-1]
+        if len(items) > 1:
+            pitch = items[0]
+        yield Control("chord", (pitch, chord))
+
     @staticmethod
     def section(items):
         secs = tuple(items)
         yield Section(secs)
-    
+
     @staticmethod
     def bar(items):
         yield Section(relative=True)
@@ -364,11 +373,11 @@ class transformer(lark.Transformer):
                 note = (i.data, i.children[0])
         yield Note(note, force=force, pitch=pitch, beat=beat, hold=hold)
         # print("note", note, force, pitch, beat, hold)
-    
+
     @staticmethod
     def chord_params(items):
         return items
-    
+
     @staticmethod
     def chord_param(items):
         # TODO
@@ -380,7 +389,7 @@ class transformer(lark.Transformer):
     @staticmethod
     def item(items):
         return items[0]
-    
+
     @staticmethod
     def name(items):
         [x] = items
@@ -393,7 +402,7 @@ class transformer(lark.Transformer):
             return int(x.value)
         except ValueError:
             return float(x.value)
-        
+
     @staticmethod
     def int(items):
         [x] = items
@@ -406,7 +415,7 @@ class transformer(lark.Transformer):
     @staticmethod
     def pitch(items) -> Pitch:
         return sum([Pitch(x.value) for x in items], Pitch())
-    
+
     @staticmethod
     def beat(items) -> Beat:
         return sum([Beat(x.value) for x in items], Beat())
@@ -464,14 +473,14 @@ class Track:
     def __init__(self):
         self.instrument = "Midi[1]"
         self.volume = 1.
-        self.chord = (Pitch(), ChordDef("", (0, 4, 7)))
+        self.chord = Chord((0, 4, 7))
         self.holdcount = 0
         self.holdmode = "default"
         self.pointertime = Timeline(0.)
         self.starttime = Timeline(0.)
 
 class VM:
-    def __init__(self):
+    def __init__(self, chordextend=True, intervalunit=False):
         self.chordlist: Dict[str, ChordDef] = {}
         self.chordmap: Dict[str, ChordMap] = {}
         self.trackname: str = ""
@@ -480,12 +489,31 @@ class VM:
         self.bps: float = 120. / 60
         self.base: int = 0
         self.pending: List[Sound] = []
+        self.chordextend: bool = chordextend
+        self.intervalunit: bool = intervalunit
 
     def cur_track(self) -> Track:
         return self.tracklist[self.trackname]
 
+class Chord:
+    def __init__(self, chord: (ChordDef, Iterable[Union[int, str]])):
+        if isinstance(chord, ChordDef):
+            chord = chord.args
+        self.chord: Tuple[Union[int, str], ...] = tuple(chord)
+
+    def __repr__(self):
+        return "<chord %s>" % (self.chord,)
+
+    def __add__(self, o: (Pitch, int)):
+        if isinstance(o, Pitch):
+            o: int = o.get_value()
+        return Chord([i+o if not isinstance(i, str) else i for i in self.chord])
+
+    def map(self, o: ChordMap):
+        return Chord([p.get_value()+self.chord[i-1] for p, i in o.args if i <= len(self.chord) and not isinstance(self.chord[i-1], str)])
+
 class Sound:
-    def __init__(self, track: str, starttime: (float, Tuple[float]), note: (List[int], str), type: str, force: float, beat: float, hold: (int, str)):
+    def __init__(self, track: str, starttime: (float, Tuple[float, ...]), note: (List[int], str), type: str, force: float, beat: float, hold: (int, str)):
         self.track = track
         self.start = starttime
         self.type = type
@@ -505,8 +533,22 @@ class Sound:
             h = "?"
         if isinstance(h, (int, float)):
             h = h / state.bps
-        return Sound(state.trackname, state.cur_track().starttime.i, note.note,
-                     type=note.type, force=note.force.get_value(), beat=b, hold=h or 0)
+        n, t = note.note, note.type
+        if t == "chord_instance":
+            if n in state.chordmap:
+                t = "chord"
+                # print("map", state.cur_track().chord, n)
+                n = state.cur_track().chord.map(state.chordmap[n]).chord
+            else:
+                t = "tag"
+        elif t == "chord_const":
+            t = "chord"
+            n = tuple(n)
+        elif t == "note_main":
+            t = "note"
+            n = (n,)
+        return Sound(state.trackname, state.cur_track().starttime.i, n,
+                     type=t, force=note.force.get_value(), beat=b, hold=h or 0)
 
 def gen_ast(txt: str) -> lark.Tree:
     return parser.parse(txt)
@@ -524,7 +566,15 @@ def exec_ir(ir: Iterable[IR], *, state=None) -> Iterable[Sound]:
             elif i.name == "instrument":
                 state.cur_track().instrument = i.value
             elif i.name == "chord":
-                state.cur_track().chord = i.value if len(i.value) == 2 else (Pitch, i.value)
+                pitch, name = i.value
+                chord = None
+                if name in state.chordlist:
+                    chord = Chord(state.chordlist[name])
+                elif state.chordextend:
+                    if name[0] in majorlist:
+                        name1 = "C" + name[1:]
+                        chord = Chord(state.chordlist[name1]) + majorlist[name[0]]
+                state.cur_track().chord = chord + pitch
             elif i.name == "holdmode":
                 state.cur_track().holdmode = i.value
             elif i.name == "barbeat":
@@ -575,4 +625,3 @@ if __name__ == "__main__":
         txt = f.read()
     for ii in exec_ir(gen_ir(gen_ast(txt))):
         print(ii)
-
