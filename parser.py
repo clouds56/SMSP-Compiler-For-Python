@@ -33,12 +33,12 @@ def to_token(l):
 # TODO: int vs number
 
 parser = lark.Lark("""
-BAR: "|"
+_BAR: "|"
 FORCE: """ + to_token(forcelist) + """
 PITCH: """ + to_token(pitchlist) + """
 BEAT: """ + to_token(beatlist) + """
 HOLD: """ + to_token(fixedholdlist) + """
-HOLD_END: "&"
+_HOLD_END: "&"
 
 CNAME: LETTER | DIGIT
 INT: DIGIT+
@@ -57,7 +57,7 @@ pitch: PITCH+
 beat: BEAT+
 hold: HOLD+ | "`"
 
-bar: BAR
+bar: _BAR
 chord_param: pitch? item
 chord_params: "<" chord_param ("," chord_param)* ">"
 chord: name? chord_params
@@ -65,7 +65,7 @@ section: "(" number ("," number)* ")"
 note_main: int
          | name -> chord_instance
 note: force? pitch? note_main beat? hold?
-hold_end: HOLD_END
+hold_end: _HOLD_END
 ?funcparam: funccall | item
 ?funccall: FUNC_CALL funcparam? ("," funcparam)* "]" -> funccall
 holdmode: "&[" item "]"
@@ -86,7 +86,7 @@ smsp: statement*
 %import common.DIGIT
 %import common.LETTER
 %ignore WS
-""", start="smsp", parser='lalr')
+""", start="smsp", parser='lalr', propagate_positions=True)
 
 
 # In[5]:
@@ -98,9 +98,12 @@ smsp: statement*
 # In[6]:
 
 
-from typing import List, Dict, Tuple, Union, Iterable, Callable, Optional
-import sys
+from typing import List, Dict, Tuple, Union, Iterable, Optional
 import collections
+from typeguard import typechecked
+
+Number = Union[int, float]
+item_t = Union[Number, str]
 
 
 # In[7]:
@@ -111,18 +114,6 @@ def num(s):
         return int(s)
     except ValueError:
         return float(s)
-
-def get_item(x: (lark.Tree, lark.lexer.Token)) -> Union[int, str]:
-    if isinstance(x, lark.Tree):
-        assert(x.data == "item" and len(x.children) == 1)
-        x = x.children[0]
-    if isinstance(x, lark.lexer.Token):
-        if x.type == "NUMBER":
-            return num(x.value)
-        elif x.type == "NAME":
-            return x.value
-    print(x)
-    assert(False)
 
 def yield_from(l):
     yield from l
@@ -152,8 +143,11 @@ class AdditiveMap():
         return "<%s %s %s>" % (self.name, self.s, self.get_value())
 
     def __add__(self, o):
-        assert(self.name == o.name)
-        return self.__class__(self.s + o.s)
+        assert(self.__class__ != AdditiveMap)
+        return self.make(self.__class__, self.s + o.s)
+
+    def make(self, cls, s):
+        return cls(s)
 
 class Force(AdditiveMap):
     def __init__(self, s=""):
@@ -166,6 +160,7 @@ class Pitch(AdditiveMap):
         super().__init__(pitchlist, 0)
         self.name = "pitch"
         self.s = s
+chord_elem_t = Tuple[Pitch, Union[int, str]]
 
 class Beat(AdditiveMap):
     def __init__(self, s=""):
@@ -197,30 +192,43 @@ class FixedHold(AdditiveMap, Hold):
     def get_value(self, s=None) -> (Optional[str], float):
         return super().get_value(s)
 
+class SrcLocation:
+    def __init__(self, node: lark.Tree=None, **kwargs):
+        try:
+            self.line: int = node.line
+            self.column: int = node.column
+            self.end_line: int = node.end_line
+            self.end_column: int = node.end_column
+        except AttributeError:
+            pass
+        self.info = kwargs
+
+    def __repr__(self):
+        return "#%d:%d" % (self.line, self.column)
+
 class IR:
-    def __init__(self, line_begin=-1, line_end=-1):
-        self.line_begin = line_begin
-        self.line_end = line_end
+    def __init__(self, loc: SrcLocation):
+        self.loc = loc
 
 class Control(IR):
-    def __init__(self, name, value):
-        super().__init__()
+    def __init__(self, name, value, *, loc):
+        super().__init__(loc)
         self.name = name
         self.value = value
 
     def __repr__(self):
-        return "<control %s=%s>" % (self.name, self.value)
+        return "<control%s %s=%s>" % (self.loc, self.name, self.value)
 
 class Section(IR):
-    def __init__(self, value=None, *, relative=False):
-        super().__init__()
+    def __init__(self, value=None, *, loc, relative=False):
+        super().__init__(loc)
         if value is None:
             value = 1 if relative else 0
         self.value = value
         self.relative = relative
 
     def __repr__(self):
-        return "<section %s%s>" % ("+" if self.relative else "", self.value)
+        return "<section%s %s%s>" % (self.loc, "+" if self.relative else "", self.value)
 
 class Func:
     def __init__(self, s):
@@ -235,26 +243,26 @@ class Func:
         return "<func %s %s>" % (self.name, self.args or "")
 
 class ChordDef(IR):
-    def __init__(self, name: str, args: Iterable[Union[int, str]]):
-        super().__init__()
+    def __init__(self, name: str, args: Iterable[chord_elem_t], *, loc: SrcLocation):
+        super().__init__(loc)
         self.name = name
-        self.args = tuple(args)
+        self.args: Tuple[Union[int, str], ...] = tuple([p.get_value()+i if not isinstance(i, str) else i for p, i in args])
 
     def __repr__(self):
-        return "<chord_def %s %s>" % (self.name, self.args)
+        return "<chord_def%s %s %s>" % (self.loc, self.name, self.args)
 
 class ChordMap(IR):
-    def __init__(self, name: str, args: Iterable[Union[int, Tuple[Pitch, int]]]):
-        super().__init__()
+    def __init__(self, name: str, args: Iterable[chord_elem_t], *, loc: SrcLocation):
+        super().__init__(loc)
         self.name = name
         self.args: Tuple[Tuple[Pitch, int], ...] = tuple((Pitch(), i) if isinstance(i, (int, float)) else i for i in args)
 
     def __repr__(self):
-        return "<chord_map %s %s>" % (self.name, self.args)
+        return "<chord_map%s %s %s>" % (self.loc, self.name, self.args)
 
 class Note(IR):
-    def __init__(self, note, force: Force, pitch: Pitch, beat: Beat, hold: Hold):
-        super().__init__()
+    def __init__(self, note, force: Force, pitch: Pitch, beat: Beat, hold: Hold, *, loc: SrcLocation):
+        super().__init__(loc)
         self.type, self.note = note
         self.force = force
         self.pitch = pitch
@@ -263,19 +271,44 @@ class Note(IR):
 
     def __repr__(self):
         h = self.hold.get_value()
-        return "<note %s f=%s,p=%s,b=%s%s>" % (self.note, self.force.get_value(), self.pitch.get_value(), self.beat.get_value(), ("h="+h) if h is not None else "")
+        return "<note%s %s f=%s,p=%s,b=%s%s>" % (self.loc, self.note, self.force.get_value(), self.pitch.get_value(), self.beat.get_value(), ("h="+h) if h is not None else "")
 
 class HoldEnd(IR):
-    def __init__(self, value=None):
-        super().__init__()
+    def __init__(self, value=None, *, loc: SrcLocation):
+        super().__init__(loc)
         self.value = value
 
     def __repr__(self):
-        return "<hold_end>" if self.value is None else "<hold_end %s>" % self.value
+        return "<hold_end%s%s>" % (self.loc, "" if self.value is None else " " + self.value)
 
-class transformer(lark.Transformer):
-    @staticmethod
-    def statement(items):
+import lark.tree
+class Transformer:
+    def _get_func(self, name):
+        return getattr(self, name)
+
+    def transform(self, tree):
+        items = []
+        for c in tree.children:
+            try:
+                items.append(self.transform(c) if isinstance(c, lark.Tree) else c)
+            except lark.tree.Discard:
+                pass
+        try:
+            f = self._get_func(tree.data)
+        except AttributeError:
+            return self.__default__(tree.data, items)
+        else:
+            return f(tree, *items)
+
+    def __default__(self, data, children):
+        return lark.Tree(data, children)
+
+    def __mul__(self, other):
+        return lark.tree.TransformerChain(self, other)
+
+class transformer(Transformer):
+    @typechecked
+    def statement(self, node: lark.Tree, *items):
         [stat] = items
         if stat is not None:
             if isinstance(stat, collections.Iterable):
@@ -285,80 +318,79 @@ class transformer(lark.Transformer):
             else:
                 print("unknown statement ", stat)
 
-    @staticmethod
-    def chord(items):
-        params = items[-1]
+    @typechecked
+    def chord(self, node: lark.Tree, *items: Union[str, Tuple[chord_elem_t, ...]]):
+        params: Tuple[chord_elem_t, ...] = items[-1]
         if len(items) > 1:
             name = items[0]
         else:
-            name = "U#" + str(tuple(params))
+            name = "U#" + str(tuple([i if p.s == "" else p.s+str(i) for p, i in params]))
         if name == "" or name[0].isupper():
-            yield ChordDef(name, params)
+            yield ChordDef(name, params, loc=SrcLocation(node))
             if name.startswith("U#"):
-                yield Control("chord", (Pitch(), name))
+                yield Control("chord", (Pitch(), name), loc=SrcLocation(node))
         else:
-            yield ChordMap(name, params)
+            yield ChordMap(name, params, loc=SrcLocation(node))
         # print("chord", name, params)
 
-    @staticmethod
-    def funccall(items):
-        [name, *params] = items
-        name: str = name[:-1]
+    @typechecked
+    def funccall(self, node: lark.Tree, name: str, *params):
+        name = name[:-1]
         if name == "i":
-            return yield_from([Control("instrument", params[0])])
+            return yield_from([Control("instrument", params[0], loc=SrcLocation(node))])
         elif name == "m":
-            return yield_from([Control(v, params[i]) for i, v in enumerate(["barbeat", "bpm", "base"])])
+            return yield_from([Control(v, params[i], loc=SrcLocation(node)) for i, v in enumerate(["barbeat", "bpm", "base"])])
         elif name == "v":
-            return yield_from([Control("volume", params[0])])
+            return yield_from([Control("volume", params[0], loc=SrcLocation(node))])
         else:
             # print("*funccall", name, params)
             return Func(name).bind(params)
 
-    @staticmethod
-    def funcparam(items):
-        [i] = items
+    @typechecked
+    def funcparam(self, node: lark.Tree, i: Union[Func, item_t]):
         # print("funcparam", i, file=sys.stderr)
         return i
 
-    @staticmethod
-    def switch_track(items):
-        [name] = items
-        yield Control("track", name)
+    @typechecked
+    def switch_track(self, node: lark.Tree, name: str):
+        yield Control("track", name, loc=SrcLocation(node))
 
-    @staticmethod
-    def switch_chord(items):
-        pitch, chord = Pitch(), items[-1]
-        if len(items) > 1:
-            pitch = items[0]
-        yield Control("chord", (pitch, chord))
+    @typechecked
+    def switch_chord(self, node: lark.Tree, *items: Union[Pitch, str]):
+        if len(items) == 2:
+            pitch, chord = items
+        elif len(items) == 1:
+            pitch, chord = Pitch(), *items
+        else:
+            pitch, chord = Pitch(), None
+        yield Control("chord", (pitch, chord), loc=SrcLocation(node))
 
-    @staticmethod
-    def section(items):
+    @typechecked
+    def section(self, node: lark.Tree, *items: Number):
         secs = tuple(items)
-        yield Section(secs)
+        yield Section(secs, loc=SrcLocation(node))
 
-    @staticmethod
-    def bar(items):
-        yield Section(relative=True)
+    @typechecked
+    def bar(self, node: lark.Tree):
+        yield Section(relative=True, loc=SrcLocation(node))
 
-    @staticmethod
-    def hold_end(items):
-        yield HoldEnd()
+    @typechecked
+    def hold_end(self, node: lark.Tree):
+        yield HoldEnd(loc=SrcLocation(node))
 
-    @staticmethod
-    def holdmode(items):
-        [i] = items
+    @typechecked
+    def holdmode(self, node: lark.Tree, i: item_t):
         if i in freeholdrule:
             i = freeholdrule[i]
         if i in freeholdrule.values():
-            yield Control("holdmode", i)
-        elif isinstance(i, (float, int)):
-            yield HoldEnd(i)
+            yield Control("holdmode", i, loc=SrcLocation(node))
+        elif isinstance(i, Number):
+            yield HoldEnd(i, loc=SrcLocation(node))
         else:
             assert(False)
 
-    @staticmethod
-    def note(items):
+    @typechecked
+    def note(self, node: lark.Tree, *items: Union[Force, Pitch, Beat, Hold, lark.Tree]):
         force, pitch, note, beat, hold = Force(), Pitch(), None, Beat(), Hold()
         for i in items:
             if isinstance(i, Force):
@@ -371,57 +403,54 @@ class transformer(lark.Transformer):
                 hold = i
             elif isinstance(i, lark.Tree):
                 note = (i.data, i.children[0])
-        yield Note(note, force=force, pitch=pitch, beat=beat, hold=hold)
+        yield Note(note, force=force, pitch=pitch, beat=beat, hold=hold, loc=SrcLocation(node))
         # print("note", note, force, pitch, beat, hold)
 
-    @staticmethod
-    def chord_params(items):
+    @typechecked
+    def chord_params(self, node, *items: chord_elem_t):
         return items
 
-    @staticmethod
-    def chord_param(items):
+    @typechecked
+    def chord_param(self, node, *items: Union[Pitch, int, str]) -> chord_elem_t:
         # TODO
         if len(items) == 1:
-            return items[0]
+            return Pitch(), items[0]
         else:
             return sum(items[:-1], Pitch()), items[-1]
 
-    @staticmethod
-    def item(items):
-        return items[0]
+    @typechecked
+    def item(self, node, x: item_t):
+        return x
 
-    @staticmethod
-    def name(items):
-        [x] = items
+    @typechecked
+    def name(self, node, x: lark.lexer.Token) -> str:
         return x.value
 
-    @staticmethod
-    def number(items):
-        [x] = items
+    @typechecked
+    def number(self, node, x: lark.lexer.Token) -> Number:
         try:
             return int(x.value)
         except ValueError:
             return float(x.value)
 
-    @staticmethod
-    def int(items):
-        [x] = items
+    @typechecked
+    def int(self, node, x: lark.lexer.Token) -> int:
         return int(x.value)
 
-    @staticmethod
-    def force(items) -> Force:
+    @typechecked
+    def force(self, node, *items: lark.lexer.Token) -> Force:
         return sum([Force(x.value) for x in items], Force())
 
-    @staticmethod
-    def pitch(items) -> Pitch:
+    @typechecked
+    def pitch(self, node, *items: lark.lexer.Token) -> Pitch:
         return sum([Pitch(x.value) for x in items], Pitch())
 
-    @staticmethod
-    def beat(items) -> Beat:
+    @typechecked
+    def beat(self, node, *items: lark.lexer.Token) -> Beat:
         return sum([Beat(x.value) for x in items], Beat())
 
-    @staticmethod
-    def hold(items) -> Hold:
+    @typechecked
+    def hold(self, node, *items: lark.lexer.Token) -> Hold:
         if len(items) == 0:
             return Hold(fixed=False)
         return sum([FixedHold(x.value) for x in items], FixedHold())
@@ -513,7 +542,7 @@ class Chord:
         return Chord([p.get_value()+self.chord[i-1] for p, i in o.args if i <= len(self.chord) and not isinstance(self.chord[i-1], str)])
 
 class Sound:
-    def __init__(self, track: str, starttime: (float, Tuple[float, ...]), note: (List[int], str), type: str, force: float, beat: float, hold: (int, str)):
+    def __init__(self, track: str, starttime: (float, Tuple[float, ...]), note: (List[int], str), type: str, force: float, beat: float, hold: (int, str), loc: SrcLocation):
         self.track = track
         self.start = starttime
         self.type = type
@@ -521,9 +550,10 @@ class Sound:
         self.force = force
         self.beat = beat
         self.hold = hold
+        self.loc = loc
 
     def __repr__(self):
-        return "<sound %s %s (%s) %s f=%s,b=%s,h=%s>" % (self.track, self.start, self.type, self.note, self.force, self.beat, self.hold)
+        return "<sound%s %s %s (%s) %s f=%s,b=%s,h=%s>" % (self.loc, self.track, self.start, self.type, self.note, self.force, self.beat, self.hold)
 
     @staticmethod
     def from_note(note: Note, state: VM):
@@ -548,7 +578,7 @@ class Sound:
             t = "note"
             n = (n,)
         return Sound(state.trackname, state.cur_track().starttime.i, n,
-                     type=t, force=note.force.get_value(), beat=b, hold=h or 0)
+                     type=t, force=note.force.get_value(), beat=b, hold=h or 0, loc=note.loc)
 
 def gen_ast(txt: str) -> lark.Tree:
     return parser.parse(txt)
@@ -556,7 +586,7 @@ def gen_ast(txt: str) -> lark.Tree:
 def gen_ir(ast: lark.Tree) -> Iterable[IR]:
     yield from gather_from(transformer().transform(ast).children)
 
-def exec_ir(ir: Iterable[IR], *, state=None) -> Iterable[Sound]:
+def exec_ir(ir: Iterable[IR], *, state: VM=None) -> Iterable[Sound]:
     if state is None:
         state = VM()
     for i in ir:
