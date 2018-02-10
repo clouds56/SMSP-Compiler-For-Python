@@ -120,7 +120,8 @@ class compiler:
 
         self.trclist[self.trackname] = dict(self.deftrack.items())
 
-    def eval(self, input_:str): # TODO: should use eval?
+    @staticmethod
+    def eval(input_:str): # TODO: should use eval?
         return eval(input_.replace("^", "**"), {}, {})
 
     def now_track(self):
@@ -144,7 +145,7 @@ class compiler:
             with open(filename) as f:
                 return self.delete_comment(f.read())
         except:
-            if directories == None or len(directories) == 0:
+            if directories is None or len(directories) == 0:
                 raise
             for i in directories:
                 try:
@@ -164,7 +165,8 @@ class compiler:
         """
         return re.sub(self.symbols["include"]+"(\S+)", lambda s: self.include(self.import_(s.group(1), directories=directories)), input_)
 
-    def is_valid_input(self, input_:str) -> bool:
+    @staticmethod
+    def is_valid_input(input_:str) -> bool:
         count = 0
         for i in input_:
             if i == '[':
@@ -222,7 +224,8 @@ class compiler:
                 return m.group(kind) if name not in self.flist else self.flist[name]()
         return re.sub("|".join(["(?P<%s_>%s)" % i for i in tokens]), _fun, input_)
 
-    def compile_f(self, input_:str, output:str):
+    @staticmethod
+    def compile_f(input_:str, output:str):
         params = re.findall("[0-9a-zA-Z]+", input_)
         def _fun(*args):
             rd = dict(zip(params, args))
@@ -232,10 +235,6 @@ class compiler:
     def apply_f(self, input_:str, func) -> str:
         args = input_.split(",")
         return self.func_replace(func(*args))
-
-    def set_flist(self, name:str, func) -> str:
-        self.flist[name] = func
-        return ""
 
     def note_pitch(self, pitch:str, element:str):
         """
@@ -337,7 +336,6 @@ class compiler:
             starttime = self.now_track()["starttime"]
             self.track_add_to("starttime", 60*beatvalue/self.bpm)
             return starttime, self.note_pitch(pitch, element), self.note_hold(hold, beatvalue, starttime), self.note_force(force), self.now_track()["instrument"], self.now_track()["volume"]
-
 
     def bar_main(self):
         """
